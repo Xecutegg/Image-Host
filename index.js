@@ -1,12 +1,17 @@
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
-const fetch = require('node-fetch');
+const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 
 const app = express();
 const PORT = 3000;
+
+// Create uploads directory if it doesn't exist
+if (!fs.existsSync('./uploads')) {
+  fs.mkdirSync('./uploads');
+}
 
 // CORS disabled (no restrictions)
 app.use(cors());
@@ -25,10 +30,16 @@ const upload = multer({ storage });
 // Parse JSON
 app.use(express.json());
 
+// Helper to determine protocol
+function getProtocol(host) {
+  return host.includes('localhost') || host.includes('127.0.0.1') ? 'http' : 'https';
+}
+
 // Upload from form
 app.post('/upload', upload.single('image'), (req, res) => {
   if (!req.file) return res.status(400).send('No file uploaded');
-  const imageUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+  const protocol = getProtocol(req.get('host'));
+  const imageUrl = `${protocol}://${req.get('host')}/uploads/${req.file.filename}`;
   res.json({ imageUrl });
 });
 
@@ -38,23 +49,74 @@ app.post('/upload-url', async (req, res) => {
     const { imageUrl } = req.body;
     if (!imageUrl) return res.status(400).json({ error: 'URL required' });
 
-    const response = await fetch(imageUrl);
-    if (!response.ok) throw new Error('Failed to fetch image');
+    const response = await axios({
+      method: 'GET',
+      url: imageUrl,
+      responseType: 'stream',
+      headers: {
+        'User-Agent': 'Mozilla/5.0'
+      }
+    });
 
-    const ext = path.extname(imageUrl).split('?')[0] || '.jpg';
+    // Get extension from URL or content-type
+    let ext = path.extname(imageUrl).split('?')[0];
+    if (!ext) {
+      const contentType = response.headers['content-type'];
+      if (contentType) {
+        if (contentType.includes('png')) ext = '.png';
+        else if (contentType.includes('jpeg') || contentType.includes('jpg')) ext = '.jpg';
+        else if (contentType.includes('gif')) ext = '.gif';
+        else if (contentType.includes('webp')) ext = '.webp';
+        else ext = '.jpg';
+      } else {
+        ext = '.jpg';
+      }
+    }
+
+    const host = req.get('host');
+    const protocol = getProtocol(host);
     const filename = `${Date.now()}${ext}`;
     const filePath = path.join(__dirname, 'uploads', filename);
     const fileStream = fs.createWriteStream(filePath);
 
-    response.body.pipe(fileStream);
-    response.body.on('error', err => res.status(500).send('Stream error'));
+    response.data.pipe(fileStream);
 
     fileStream.on('finish', () => {
-      const finalUrl = `${req.protocol}://${req.get('host')}/uploads/${filename}`;
+      const finalUrl = `${protocol}://${host}/uploads/${filename}`;
+      console.log('Image saved:', finalUrl);
       res.json({ imageUrl: finalUrl });
     });
+
+    fileStream.on('error', (err) => {
+      console.error('Stream error:', err);
+      res.status(500).json({ error: 'Failed to save image' });
+    });
   } catch (err) {
+    console.error('Upload error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Proxy route to fetch images from external URLs
+app.get('/proxy', async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) return res.status(400).send('URL parameter required');
+
+    const response = await axios({
+      method: 'GET',
+      url: url,
+      responseType: 'stream'
+    });
+
+    // Set content type from external source
+    if (response.headers['content-type']) {
+      res.setHeader('content-type', response.headers['content-type']);
+    }
+
+    response.data.pipe(res);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch image' });
   }
 });
 
